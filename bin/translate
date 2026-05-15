@@ -1,0 +1,252 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+require __DIR__ . '/../vendor/autoload.php';
+
+use App\Application\PackCommand;
+use App\Application\TranslateBookUseCase;
+use App\Application\TranslateCommand;
+use App\Domain\BookMetadataTranslatorInterface;
+use App\Domain\CoverTranslatorInterface;
+use App\Domain\EpubRepositoryInterface;
+use App\Domain\SummarizerInterface;
+use App\Domain\SummaryCacheInterface;
+use App\Domain\TranslationCacheInterface;
+use App\Domain\TranslatorInterface;
+use App\Infrastructure\EpubHandler;
+use App\Infrastructure\FileSummaryCache;
+use App\Infrastructure\FileTranslationCache;
+use App\Infrastructure\FileTranslationChunkCache;
+use App\Infrastructure\Http\RetryingGuzzleClientFactory;
+use App\Infrastructure\LLM\LlmCoverTranslator;
+use App\Infrastructure\LLM\LlmUsageTracker;
+use App\Infrastructure\LLM\OpenAICompatibleClient;
+use App\Infrastructure\LlmBookMetadataTranslator;
+use App\Infrastructure\LlmSummarizer;
+use App\Infrastructure\LlmTranslator;
+use App\Infrastructure\TranslationChunkCacheInterface;
+use DI\ContainerBuilder;
+use Dotenv\Dotenv;
+use Symfony\Component\Console\Application;
+
+$dotenv = Dotenv::createImmutable(__DIR__ . '/..');
+$dotenv->safeLoad();
+
+$requireEnv = static function (string $name): string {
+    $value = $_ENV[$name] ?? null;
+    if (!is_string($value) || trim($value) === '') {
+        fwrite(STDERR, "Missing required environment variable: {$name}\n");
+        exit(1);
+    }
+    return $value;
+};
+
+$requireFile = static function (string $relativePath): string {
+    $absolute = __DIR__ . '/../' . $relativePath;
+    if (!is_file($absolute)) {
+        fwrite(STDERR, "Missing required prompt file: {$relativePath}\n");
+        exit(1);
+    }
+    $content = trim((string) file_get_contents($absolute));
+    if ($content === '') {
+        fwrite(STDERR, "Prompt file is empty: {$relativePath}\n");
+        exit(1);
+    }
+    return $content;
+};
+
+$openAiApiKey = $requireEnv('OPENAI_COMPATIBLE_API_KEY');
+$openAiApiUrl = $requireEnv('OPENAI_COMPATIBLE_API_URL');
+$openAiModel = $requireEnv('OPENAI_COMPATIBLE_MODEL');
+$targetLanguage = $requireEnv('TRANSLATION_TARGET_LANGUAGE');
+$translationTemperature = (float) $requireEnv('TRANSLATION_TEMPERATURE');
+$summaryTemperature = (float) $requireEnv('SUMMARY_TEMPERATURE');
+$maxRetries = (int) $requireEnv('LLM_MAX_RETRIES');
+$baseDelayMs = (int) $requireEnv('LLM_RETRY_BASE_DELAY_MS');
+$llmConnectTimeout = (int) $requireEnv('LLM_CONNECT_TIMEOUT');
+$llmRequestTimeout = (int) $requireEnv('LLM_REQUEST_TIMEOUT');
+
+$optionalPositiveInt = static function (string $name): ?int {
+    $value = $_ENV[$name] ?? null;
+    if (!is_string($value) || trim($value) === '') {
+        return null;
+    }
+    $int = (int) $value;
+    if ($int <= 0) {
+        fwrite(STDERR, "Environment variable {$name} must be a positive integer or empty\n");
+        exit(1);
+    }
+    return $int;
+};
+
+$llmMaxOutputTokens = $optionalPositiveInt('LLM_MAX_OUTPUT_TOKENS');
+
+$coverApiKey = $requireEnv('COVER_API_KEY');
+$coverApiUrl = $requireEnv('COVER_API_URL');
+$coverModel = $requireEnv('COVER_MODEL');
+$coverRequestTimeout = (int) $requireEnv('COVER_REQUEST_TIMEOUT');
+
+$translationPrompt = $requireFile('prompts/TRANSLATION_PROMPT.md');
+$summaryPrompt = $requireFile('prompts/SUMMARY_PROMPT.md');
+$coverPrompt = $requireFile('prompts/COVER_PROMPT.md');
+$metadataPrompt = $requireFile('prompts/METADATA_PROMPT.md');
+
+$llmHttpClient = RetryingGuzzleClientFactory::create(
+    maxRetries: $maxRetries,
+    baseDelayMs: $baseDelayMs,
+    requestTimeoutSec: $llmRequestTimeout,
+    connectTimeoutSec: $llmConnectTimeout,
+);
+
+$coverHttpClient = RetryingGuzzleClientFactory::create(
+    maxRetries: $maxRetries,
+    baseDelayMs: $baseDelayMs,
+    requestTimeoutSec: $coverRequestTimeout,
+    connectTimeoutSec: $llmConnectTimeout,
+);
+
+$cacheDir = __DIR__ . '/../.cache';
+
+$usageTracker = new LlmUsageTracker();
+
+$containerBuilder = new ContainerBuilder();
+$containerBuilder->addDefinitions([
+    TranslateCommand::class => DI\autowire()
+        ->constructorParameter('targetLanguage', $targetLanguage)
+        ->constructorParameter('cacheDir', $cacheDir)
+        ->constructorParameter('usageTracker', $usageTracker)
+        ->constructorParameter('modelName', $openAiModel),
+
+    TranslateBookUseCase::class => DI\autowire()
+        ->constructorParameter('coverTranslator', DI\get(CoverTranslatorInterface::class))
+        ->constructorParameter('metadataTranslator', DI\get(BookMetadataTranslatorInterface::class)),
+
+    EpubRepositoryInterface::class => DI\create(EpubHandler::class)
+        ->constructor($cacheDir),
+    SummaryCacheInterface::class => DI\create(FileSummaryCache::class)
+        ->constructor(__DIR__ . '/../.summary_cache.json'),
+    TranslationCacheInterface::class => DI\create(FileTranslationCache::class)
+        ->constructor(__DIR__ . '/../.translation_cache.json'),
+    TranslationChunkCacheInterface::class => DI\create(FileTranslationChunkCache::class)
+        ->constructor(__DIR__ . '/../.chunk_cache.json'),
+
+    TranslatorInterface::class => static function (\Psr\Container\ContainerInterface $c) use (
+        $translationPrompt,
+        $openAiApiKey,
+        $openAiApiUrl,
+        $openAiModel,
+        $targetLanguage,
+        $translationTemperature,
+        $llmHttpClient,
+        $usageTracker,
+        $llmMaxOutputTokens,
+    ) {
+        $client = new OpenAICompatibleClient(
+            $openAiApiKey,
+            $llmHttpClient,
+            $openAiApiUrl,
+            $openAiModel,
+            $translationTemperature,
+            $usageTracker,
+            $llmMaxOutputTokens,
+        );
+
+        return new LlmTranslator(
+            llmClient: $client,
+            targetLanguage: $targetLanguage,
+            translatePrompt: $translationPrompt,
+            chunkCache: $c->get(TranslationChunkCacheInterface::class),
+        );
+    },
+
+    SummarizerInterface::class => static function () use (
+        $summaryPrompt,
+        $openAiApiKey,
+        $openAiApiUrl,
+        $openAiModel,
+        $summaryTemperature,
+        $llmHttpClient,
+        $usageTracker,
+        $llmMaxOutputTokens,
+    ) {
+        $client = new OpenAICompatibleClient(
+            $openAiApiKey,
+            $llmHttpClient,
+            $openAiApiUrl,
+            $openAiModel,
+            $summaryTemperature,
+            $usageTracker,
+            $llmMaxOutputTokens,
+        );
+
+        return new LlmSummarizer(
+            $client,
+            $summaryPrompt,
+        );
+    },
+
+    CoverTranslatorInterface::class => static function () use (
+        $coverPrompt,
+        $coverApiKey,
+        $coverApiUrl,
+        $coverModel,
+        $coverHttpClient
+    ) {
+        return new LlmCoverTranslator(
+            apiKey: $coverApiKey,
+            httpClient: $coverHttpClient,
+            apiUrl: $coverApiUrl,
+            model: $coverModel,
+            systemPrompt: $coverPrompt,
+        );
+    },
+
+    BookMetadataTranslatorInterface::class => static function () use (
+        $metadataPrompt,
+        $openAiApiKey,
+        $openAiApiUrl,
+        $openAiModel,
+        $targetLanguage,
+        $llmHttpClient,
+        $usageTracker,
+        $llmMaxOutputTokens,
+    ) {
+        $client = new OpenAICompatibleClient(
+            $openAiApiKey,
+            $llmHttpClient,
+            $openAiApiUrl,
+            $openAiModel,
+            0.3,
+            $usageTracker,
+            $llmMaxOutputTokens,
+        );
+
+        return new LlmBookMetadataTranslator(
+            client: $client,
+            systemPrompt: $metadataPrompt,
+            targetLanguage: $targetLanguage,
+        );
+    },
+]);
+
+try {
+    $container = $containerBuilder->build();
+    $app = new Application('Book Translator', '1.0.0');
+    $app->addCommand($container->get(TranslateCommand::class));
+    $app->addCommand($container->get(PackCommand::class));
+    $app->setDefaultCommand('translate');
+
+    $argv = $_SERVER['argv'];
+    $reservedSubcommands = ['translate', 'pack', 'list', 'help', 'completion', '_complete'];
+    $first = $argv[1] ?? null;
+    if ($first !== null && $first !== '' && $first[0] !== '-' && !in_array($first, $reservedSubcommands, true)) {
+        array_splice($argv, 1, 0, 'translate');
+    }
+
+    $app->run(new \Symfony\Component\Console\Input\ArgvInput($argv));
+} catch (\DI\DependencyException|\DI\NotFoundException|Exception $e) {
+    fwrite(STDERR, 'ошибка: ' . $e->getMessage() . "\n");
+    exit(1);
+}

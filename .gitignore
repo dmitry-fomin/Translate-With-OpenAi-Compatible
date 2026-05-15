@@ -1,0 +1,41 @@
+/vendor/
+/node_modules/
+
+# Секреты — никогда не коммитить
+.env
+.env.local
+.env.*.local
+mcp-servers.json
+*.key
+*.pem
+credentials.json
+
+# Кеши приложения
+/.summary_cache.json
+/.translation_cache.json
+/.chunk_cache.json
+/.cache/
+
+# Рабочие артефакты переводов
+/By_Nora_Gal/
+/By_Nora_Gal_Next/
+/Empire of the Dawn Rus/
+/Empire of the Dawn.epub/
+/*.epub
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Инструменты качества
+/.phpunit.result.cache
+/.phpunit.cache/
+/.php-cs-fixer.cache
+/.phpstan.cache/
+
+# Beads / Dolt — локально, не публикуется
+.beads/
+.dolt/
+*.db
+.beads-credential-key

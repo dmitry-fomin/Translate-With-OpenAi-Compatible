@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "TranslaterLLM",
+  "project_id": "d9657230-cc1f-46f8-8af6-91f5d4d2b715"
+}

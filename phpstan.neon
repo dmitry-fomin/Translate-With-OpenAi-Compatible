@@ -1,0 +1,14 @@
+parameters:
+    level: 6
+    paths:
+        - src
+        - bin
+        - tests
+    excludePaths:
+        - tests/Integration/*
+    treatPhpDocTypesAsCertain: false
+    checkMissingIterableValueType: false
+    ignoreErrors:
+        # Symfony Console — addCommand vs add (зависит от версии). Игнорируем в bootstrap, не в коде.
+        - message: '#Call to an undefined method Symfony\\Component\\Console\\Application::addCommand\(\)#'
+          path: bin/translate
